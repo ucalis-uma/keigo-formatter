@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keigo Formatter — メモを敬語ビジネス文に変換</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.7; }
+  h1 { font-size: 1.4rem; }
+  textarea, select, input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: .5rem; font-size: 1rem; }
+  textarea { min-height: 140px; }
+  #output { white-space: pre-wrap; border: 1px solid #888; border-radius: 8px; padding: .8rem; min-height: 120px; }
+  button { padding: .55rem 1.2rem; font-size: 1rem; cursor: pointer; margin: .3rem .3rem .3rem 0; }
+  #status { min-height: 1.6em; font-size: .95rem; }
+  .ok { color: green; } .err { color: crimson; }
+  details { margin-top: 1rem; font-size: .9rem; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+<h1>Keigo Formatter <small>— ラフなメモを敬語ビジネス文に変換 (Pollinations利用)</small></h1>
+
+<section>
+  <h2>1. 接続 (BYOP: あなたのPollenを使います)</h2>
+  <div id="authArea">
+    <button id="loginBtn" type="button">Pollinationsでログイン (BYOP)</button>
+    <button id="logoutBtn" type="button" style="display:none">ログアウト (キー破棄)</button>
+    <span id="loginState">未ログイン</span>
+  </div>
+  <details>
+    <summary>または自分のAPIキーを直接入力 (上級者用)</summary>
+    <input id="manualKey" type="password" placeholder="sk_... (入力はこのタブのsessionStorageにのみ保存)" autocomplete="off">
+    <button id="saveKeyBtn" type="button">このタブで使う</button>
+    <br><small>キーはサーバーに送信されません。Pollinations APIへの直接通信にのみ使います。リロードで消えます。</small>
+  </details>
+</section>
+
+<section>
+  <h2>2. 変換</h2>
+  <label>モデル:
+    <select id="model">
+      <option value="deepseek/deepseek-v4.1-flash" selected>deepseek/deepseek-v4.1-flash (既定・公式)</option>
+      <option value="deepseek/deepseek-v4-flash">deepseek/deepseek-v4-flash (公式)</option>
+      <option value="community/MarcosFRG/deepseek-v4-flash-0731">community/MarcosFRG/deepseek-v4-flash-0731 (予備)</option>
+    </select>
+  </label><br><br>
+  <label>文体:
+    <select id="style">
+      <option value="社内共有用の丁寧なビジネス文" selected>社内共有用 (丁寧語)</option>
+      <option value="社外メールの書き出しを含む丁寧で格式あるビジネス文">社外メール調 (尊敬語・謙譲語)</option>
+      <option value="チャット連絡用の簡潔で丁寧な文">チャット連絡用 (簡潔・丁寧)</option>
+    </select>
+  </label><br><br>
+  <textarea id="input" placeholder="例: 明日の会議、資料まだできてない。金曜までにやるから待ってて。"></textarea><br>
+  <button id="goBtn" type="button">敬語に変換する</button>
+  <button id="copyBtn" type="button">結果をコピー</button>
+  <div id="status" role="status"></div>
+  <h3>結果</h3>
+  <div id="output">(ここに結果が表示されます)</div>
+</section>
+
+<section>
+  <h2>仕組み</h2>
+  <small>このページは <code>https://gen.pollinations.ai/v1/chat/completions</code> をブラウザから直接呼びます。
+  ログイン時はあなたのPollenを消費します (BYOP)。開発者はあなたのキーを受け取りません。</small>
+</section>
+
+<script>
+"use strict";
+// ===== 設定 (公開リポジトリに秘密は書かない) =====
+// App Key (pk_...) は公開後に発行して差し替える。空のままではBYOPログインボタンが案内を表示する。
+const CLIENT_ID = ""; // 例: "pk_abc123" (enter.pollinations.ai/keys で発行)
+const REDIRECT_URI = location.origin + location.pathname; // Cut off query/hash; must match key's Redirect URI
+const AUTH_URL = "https://enter.pollinations.ai/authorize";
+const TOKEN_URL = "https://enter.pollinations.ai/api/oauth/token";
+const CHAT_URL = "https://gen.pollinations.ai/v1/chat/completions";
+
+let accessToken = sessionStorage.getItem("kf_token") || "";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), outputEl = $("output");
+
+function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ""; }
+function refreshLogin() {
+  const logged = !!accessToken;
+  $("loginBtn").style.display = logged ? "none" : "";
+  $("logoutBtn").style.display = logged ? "" : "none";
+  $("loginState").textContent = logged ? "ログイン中 (BYOP)" : "未ログイン";
+}
+refreshLogin();
+
+// ---------- PKCE helpers ----------
+function randStr(n) {
+  const a = new Uint8Array(n); crypto.getRandomValues(a);
+  return Array.from(a, b => ("0" + b.toString(16)).slice(-2)).join("");
+}
+async function challenge(verifier) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(d))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+$("loginBtn").onclick = async () => {
+  if (!CLIENT_ID) {
+    setStatus("BYOP用App Key (pk_...) が未設定です。公開後に発行して設定します。それまでは「自分のAPIキーを直接入力」を使ってください。", "err");
+    return;
+  }
+  const verifier = randStr(48), state = randStr(16);
+  sessionStorage.setItem("kf_verifier", verifier);
+  sessionStorage.setItem("kf_state", state);
+  const ch = await challenge(verifier);
+  const p = new URLSearchParams({
+    response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
+    scope: "profile usage", state, code_challenge: ch, code_challenge_method: "S256",
+    models: "deepseek/deepseek-v4.1-flash,deepseek/deepseek-v4-flash",
+    expiry: "7", budget: "5"
+  });
+  location.href = AUTH_URL + "?" + p.toString();
+};
+
+$("logoutBtn").onclick = () => {
+  accessToken = ""; sessionStorage.removeItem("kf_token");
+  refreshLogin(); setStatus("ログアウトしました (キーを破棄)。", "ok");
+};
+
+$("saveKeyBtn").onclick = () => {
+  const k = $("manualKey").value.trim();
+  if (!k.startsWith("sk_")) { setStatus("sk_ から始まるキーを入力してください。", "err"); return; }
+  accessToken = k; sessionStorage.setItem("kf_token", k);
+  $("manualKey").value = "";
+  refreshLogin(); setStatus("キーをこのタブに保存しました (リロードで消去)。", "ok");
+};
+
+// OAuthコールバック処理 (?code=...)
+(async function handleCallback() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get("code"), state = q.get("state");
+  if (!code) return;
+  // URLからcodeを消す
+  history.replaceState(null, "", REDIRECT_URI);
+  if (state !== sessionStorage.getItem("kf_state")) { setStatus("state不一致。もう一度ログインしてください。", "err"); return; }
+  const verifier = sessionStorage.getItem("kf_verifier");
+  try {
+    const res = await fetch(TOKEN_URL, {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, code_verifier: verifier })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.access_token) throw new Error(data.error_description || data.error || ("HTTP " + res.status));
+    accessToken = data.access_token; sessionStorage.setItem("kf_token", accessToken);
+    refreshLogin(); setStatus("ログイン成功。あなたのPollenで生成できます。", "ok");
+  } catch (e) {
+    setStatus("トークン交換失敗: " + e.message, "err");
+  }
+})();
+
+// ---------- 生成 ----------
+$("goBtn").onclick = async () => {
+  const text = $("input").value.trim();
+  if (!text) { setStatus("変換するメモを入力してください。", "err"); return; }
+  if (!accessToken) { setStatus("先にログインするか、APIキーを入力してください。", "err"); return; }
+  const model = $("model").value, style = $("style").value;
+  setStatus("生成中…"); outputEl.textContent = "";
+  $("goBtn").disabled = true;
+  try {
+    const res = await fetch(CHAT_URL, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: "あなたは日本語ビジネス文書の校正者です。ユーザーのラフなメモを、指定された文体の自然な敬語ビジネス文に変換してください。余計な解説は付けず、変換結果の本文だけを出力してください。" },
+          { role: "user", content: "【文体】" + style + "\n【メモ】\n" + text }
+        ]
+      })
+    });
+    if (res.status === 402) throw new Error("残高不足 (402): Pollen残高を確認してください。");
+    if (res.status === 429) throw new Error("レート制限 (429): 少し待って再試行してください (上限 60 req/min)。");
+    if (res.status >= 500) throw new Error("サーバー混雑 (" + res.status + "): キューが一杯の可能性があります。少し待って再試行してください。");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const out = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || "").trim();
+    if (!out) throw new Error("空の応答でした。再試行してください。");
+    outputEl.textContent = out;
+    setStatus("完了 (モデル: " + model + ")。あなたのPollenを消費しました。", "ok");
+  } catch (e) {
+    setStatus("エラー: " + e.message, "err");
+  } finally {
+    $("goBtn").disabled = false;
+  }
+};
+
+$("copyBtn").onclick = async () => {
+  try { await navigator.clipboard.writeText(outputEl.textContent); setStatus("コピーしました。", "ok"); }
+  catch (e) { setStatus("コピー失敗: " + e.message, "err"); }
+};
+</script>
+</body>
+</html>
