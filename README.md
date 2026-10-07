@@ -1,5 +1,7 @@
 # Keigo Formatter
 
+[![Made with pollinations.ai](https://raw.githubusercontent.com/pollinations/pollinations/main/packages/ui/src/brand/badge-made-with.svg)](https://pollinations.ai/?ref=badge)
+
 ラフな日本語メモを敬語ビジネス文に変換する単一ページWebアプリです。
 
 ## 使い方
